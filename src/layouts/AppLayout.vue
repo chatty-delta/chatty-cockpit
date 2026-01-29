@@ -5,6 +5,7 @@ import { ref, watch, onMounted, onUnmounted } from 'vue'
 import { useRemindersStore } from '@/stores/reminders'
 import CommandPalette from '@/components/CommandPalette.vue'
 import { useKeyboardShortcuts } from '@/composables/useKeyboardShortcuts'
+import { useReminderNotifications } from '@/composables/useReminderNotifications'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -13,6 +14,9 @@ const collapsed = ref(false)
 const reminders = useRemindersStore()
 const showCommandPalette = ref(false)
 const { showHints, navShortcuts } = useKeyboardShortcuts()
+
+// Enable reminder notifications
+useReminderNotifications()
 
 // Global Cmd+K shortcut
 function handleKeydown(e: KeyboardEvent) {
