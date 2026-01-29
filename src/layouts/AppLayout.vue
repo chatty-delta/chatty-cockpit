@@ -42,6 +42,7 @@ const navItems = [
   { path: '/calendar', icon: '📅', label: 'Kalender' },
   { path: '/files', icon: '📁', label: 'Files' },
   { path: '/knowledge', icon: '📚', label: 'Wiki' },
+  { path: '/monitoring', icon: '🔍', label: 'Monitoring' },
   { path: '/settings', icon: '⚙️', label: 'Settings' },
 ]
 

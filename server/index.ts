@@ -992,3 +992,398 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().t
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => console.log(`🚀 Chatty Cockpit API on port ${PORT}`))
+
+// ============================================================
+// Monitoring (Certificates & Health Checks)
+// ============================================================
+const MONITORING_FILE = '/home/ubuntu/clawd/monitoring.json'
+const ALERT_EMAIL = process.env.ALERT_EMAIL || 'phofmann@delta-mind.at'
+
+interface CertCheck {
+  id: string
+  url: string
+  lastCheck?: string
+  validFrom?: string
+  validTo?: string
+  daysUntilExpiry?: number
+  issuer?: string
+  status: 'ok' | 'warning' | 'error' | 'pending'
+  error?: string
+}
+
+interface HealthCheckItem {
+  id: string
+  url: string
+  name?: string
+  lastCheck?: string
+  lastStatus?: number
+  lastResponseTime?: number
+  status: 'up' | 'down' | 'pending'
+  error?: string
+  history?: { ts: string; up: boolean }[]
+}
+
+interface MonitoringData {
+  certs: CertCheck[]
+  health: HealthCheckItem[]
+}
+
+function loadMonitoring(): MonitoringData {
+  try {
+    if (existsSync(MONITORING_FILE)) {
+      return JSON.parse(readFileSync(MONITORING_FILE, 'utf-8'))
+    }
+  } catch (e) {
+    console.error('Failed to load monitoring:', e)
+  }
+  return { certs: [], health: [] }
+}
+
+function saveMonitoring(data: MonitoringData) {
+  writeFileSync(MONITORING_FILE, JSON.stringify(data, null, 2))
+}
+
+// Check SSL certificate
+async function checkCertificate(url: string): Promise<Partial<CertCheck>> {
+  const https = await import('https')
+  const { URL } = await import('url')
+  
+  return new Promise((resolve) => {
+    try {
+      const parsedUrl = new URL(url)
+      const options = {
+        hostname: parsedUrl.hostname,
+        port: 443,
+        method: 'GET',
+        rejectUnauthorized: false, // We want to check even expired certs
+        timeout: 10000
+      }
+
+      const req = https.request(options, (res) => {
+        const cert = (res.socket as any).getPeerCertificate()
+        if (!cert || !cert.valid_to) {
+          resolve({ status: 'error', error: 'Kein Zertifikat gefunden' })
+          return
+        }
+
+        const validTo = new Date(cert.valid_to)
+        const validFrom = new Date(cert.valid_from)
+        const now = new Date()
+        const daysUntilExpiry = Math.floor((validTo.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+
+        let status: 'ok' | 'warning' | 'error' = 'ok'
+        if (daysUntilExpiry <= 0) status = 'error'
+        else if (daysUntilExpiry <= 30) status = 'warning'
+
+        resolve({
+          status,
+          validFrom: validFrom.toISOString(),
+          validTo: validTo.toISOString(),
+          daysUntilExpiry,
+          issuer: cert.issuer?.O || cert.issuer?.CN || 'Unknown',
+          lastCheck: new Date().toISOString()
+        })
+      })
+
+      req.on('error', (e) => {
+        resolve({ status: 'error', error: e.message, lastCheck: new Date().toISOString() })
+      })
+
+      req.on('timeout', () => {
+        req.destroy()
+        resolve({ status: 'error', error: 'Timeout', lastCheck: new Date().toISOString() })
+      })
+
+      req.end()
+    } catch (e: any) {
+      resolve({ status: 'error', error: e.message, lastCheck: new Date().toISOString() })
+    }
+  })
+}
+
+// Check health endpoint
+async function checkHealth(url: string): Promise<Partial<HealthCheckItem>> {
+  const startTime = Date.now()
+  try {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 10000)
+
+    const res = await fetch(url, { 
+      method: 'GET',
+      signal: controller.signal,
+      headers: { 'User-Agent': 'Chatty-Cockpit-Monitor/1.0' }
+    })
+    
+    clearTimeout(timeout)
+    const responseTime = Date.now() - startTime
+
+    return {
+      status: res.ok ? 'up' : 'down',
+      lastStatus: res.status,
+      lastResponseTime: responseTime,
+      lastCheck: new Date().toISOString(),
+      error: res.ok ? undefined : `HTTP ${res.status}`
+    }
+  } catch (e: any) {
+    return {
+      status: 'down',
+      lastCheck: new Date().toISOString(),
+      lastResponseTime: Date.now() - startTime,
+      error: e.name === 'AbortError' ? 'Timeout' : e.message
+    }
+  }
+}
+
+// Send alert email
+async function sendAlertEmail(subject: string, body: string) {
+  try {
+    await transporter.sendMail({
+      from: '"Chatty Monitor" <chatty@chatty.delta-mind.at>',
+      to: ALERT_EMAIL,
+      subject,
+      html: body
+    })
+  } catch (e) {
+    console.error('Failed to send alert email:', e)
+  }
+}
+
+// Certificate endpoints
+app.get('/api/monitoring/certs', authMiddleware, (req, res) => {
+  const data = loadMonitoring()
+  res.json({ checks: data.certs })
+})
+
+app.post('/api/monitoring/certs', authMiddleware, async (req, res) => {
+  const { url } = req.body
+  if (!url) return res.status(400).json({ error: 'URL required' })
+
+  const data = loadMonitoring()
+  
+  // Check if already exists
+  if (data.certs.some(c => c.url === url)) {
+    return res.status(400).json({ error: 'URL already monitored' })
+  }
+
+  const check: CertCheck = {
+    id: uuidv4(),
+    url,
+    status: 'pending'
+  }
+
+  // Run initial check
+  const result = await checkCertificate(url)
+  Object.assign(check, result)
+
+  data.certs.push(check)
+  saveMonitoring(data)
+
+  res.json({ check })
+})
+
+app.delete('/api/monitoring/certs/:id', authMiddleware, (req, res) => {
+  const data = loadMonitoring()
+  data.certs = data.certs.filter(c => c.id !== req.params.id)
+  saveMonitoring(data)
+  res.json({ success: true })
+})
+
+app.post('/api/monitoring/certs/check-all', authMiddleware, async (req, res) => {
+  const data = loadMonitoring()
+  
+  for (const check of data.certs) {
+    const result = await checkCertificate(check.url)
+    Object.assign(check, result)
+  }
+  
+  saveMonitoring(data)
+  res.json({ checks: data.certs })
+})
+
+// Health check endpoints
+app.get('/api/monitoring/health', authMiddleware, (req, res) => {
+  const data = loadMonitoring()
+  
+  // Calculate uptime percentage
+  const checks = data.health.map(h => {
+    if (h.history && h.history.length > 0) {
+      const upCount = h.history.filter(e => e.up).length
+      h.uptimePercent = (upCount / h.history.length) * 100
+    }
+    return h
+  })
+  
+  res.json({ checks })
+})
+
+app.post('/api/monitoring/health', authMiddleware, async (req, res) => {
+  const { url, name } = req.body
+  if (!url) return res.status(400).json({ error: 'URL required' })
+
+  const data = loadMonitoring()
+  
+  if (data.health.some(h => h.url === url)) {
+    return res.status(400).json({ error: 'URL already monitored' })
+  }
+
+  const check: HealthCheckItem = {
+    id: uuidv4(),
+    url,
+    name,
+    status: 'pending',
+    history: []
+  }
+
+  // Run initial check
+  const result = await checkHealth(url)
+  Object.assign(check, result)
+  check.history = [{ ts: new Date().toISOString(), up: result.status === 'up' }]
+
+  data.health.push(check)
+  saveMonitoring(data)
+
+  res.json({ check })
+})
+
+app.delete('/api/monitoring/health/:id', authMiddleware, (req, res) => {
+  const data = loadMonitoring()
+  data.health = data.health.filter(h => h.id !== req.params.id)
+  saveMonitoring(data)
+  res.json({ success: true })
+})
+
+app.post('/api/monitoring/health/check-all', authMiddleware, async (req, res) => {
+  const data = loadMonitoring()
+  const alerts: string[] = []
+  
+  for (const check of data.health) {
+    const prevStatus = check.status
+    const result = await checkHealth(check.url)
+    Object.assign(check, result)
+    
+    // Add to history (keep last 1000 entries)
+    if (!check.history) check.history = []
+    check.history.push({ ts: new Date().toISOString(), up: result.status === 'up' })
+    if (check.history.length > 1000) check.history = check.history.slice(-1000)
+    
+    // Check for status change
+    if (prevStatus === 'up' && result.status === 'down') {
+      alerts.push(`🔴 ${check.name || check.url} ist DOWN: ${result.error}`)
+    } else if (prevStatus === 'down' && result.status === 'up') {
+      alerts.push(`🟢 ${check.name || check.url} ist wieder UP`)
+    }
+  }
+  
+  // Send alert email if any status changed
+  if (alerts.length > 0) {
+    const subject = alerts.some(a => a.includes('DOWN')) 
+      ? '🚨 Health Check Alert - Site DOWN' 
+      : '✅ Health Check - Site Recovered'
+    
+    await sendAlertEmail(subject, `
+      <div style="font-family: sans-serif; padding: 20px;">
+        <h2 style="color: ${alerts.some(a => a.includes('DOWN')) ? '#e94560' : '#10b981'};">
+          Health Check Status Update
+        </h2>
+        <ul style="line-height: 1.8;">
+          ${alerts.map(a => `<li>${a}</li>`).join('')}
+        </ul>
+        <p style="color: #666; margin-top: 20px;">
+          <a href="https://app.chatty.delta-mind.at/monitoring">Zum Cockpit →</a>
+        </p>
+      </div>
+    `)
+  }
+  
+  saveMonitoring(data)
+  res.json({ checks: data.health, alerts })
+})
+
+// Internal endpoint for cron jobs
+app.post('/api/monitoring/cron/certs', async (req, res) => {
+  const secret = req.headers['x-internal-secret']
+  if (!REMINDERS_INTERNAL_SECRET || secret !== REMINDERS_INTERNAL_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+
+  const data = loadMonitoring()
+  const warnings: string[] = []
+  
+  for (const check of data.certs) {
+    const result = await checkCertificate(check.url)
+    Object.assign(check, result)
+    
+    if (result.daysUntilExpiry !== undefined && result.daysUntilExpiry <= 30) {
+      warnings.push(`⚠️ ${check.url}: ${result.daysUntilExpiry} Tage bis Ablauf`)
+    }
+  }
+  
+  saveMonitoring(data)
+
+  // Send warning email if any certs expiring soon
+  if (warnings.length > 0) {
+    await sendAlertEmail('⚠️ SSL Zertifikate laufen bald ab', `
+      <div style="font-family: sans-serif; padding: 20px;">
+        <h2 style="color: #f59e0b;">SSL Zertifikat Warnung</h2>
+        <ul style="line-height: 1.8;">
+          ${warnings.map(w => `<li>${w}</li>`).join('')}
+        </ul>
+        <p style="color: #666; margin-top: 20px;">
+          <a href="https://app.chatty.delta-mind.at/monitoring">Zum Cockpit →</a>
+        </p>
+      </div>
+    `)
+  }
+  
+  res.json({ checked: data.certs.length, warnings })
+})
+
+app.post('/api/monitoring/cron/health', async (req, res) => {
+  const secret = req.headers['x-internal-secret']
+  if (!REMINDERS_INTERNAL_SECRET || secret !== REMINDERS_INTERNAL_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+
+  // Same as check-all but uses internal secret
+  const data = loadMonitoring()
+  const alerts: string[] = []
+  
+  for (const check of data.health) {
+    const prevStatus = check.status
+    const result = await checkHealth(check.url)
+    Object.assign(check, result)
+    
+    if (!check.history) check.history = []
+    check.history.push({ ts: new Date().toISOString(), up: result.status === 'up' })
+    if (check.history.length > 1000) check.history = check.history.slice(-1000)
+    
+    if (prevStatus === 'up' && result.status === 'down') {
+      alerts.push(`🔴 ${check.name || check.url} ist DOWN: ${result.error}`)
+    } else if (prevStatus === 'down' && result.status === 'up') {
+      alerts.push(`🟢 ${check.name || check.url} ist wieder UP`)
+    }
+  }
+  
+  if (alerts.length > 0) {
+    const subject = alerts.some(a => a.includes('DOWN')) 
+      ? '🚨 Health Check Alert - Site DOWN' 
+      : '✅ Health Check - Site Recovered'
+    
+    await sendAlertEmail(subject, `
+      <div style="font-family: sans-serif; padding: 20px;">
+        <h2 style="color: ${alerts.some(a => a.includes('DOWN')) ? '#e94560' : '#10b981'};">
+          Health Check Status Update
+        </h2>
+        <ul style="line-height: 1.8;">
+          ${alerts.map(a => `<li>${a}</li>`).join('')}
+        </ul>
+        <p style="color: #666; margin-top: 20px;">
+          <a href="https://app.chatty.delta-mind.at/monitoring">Zum Cockpit →</a>
+        </p>
+      </div>
+    `)
+  }
+  
+  saveMonitoring(data)
+  res.json({ checked: data.health.length, alerts })
+})

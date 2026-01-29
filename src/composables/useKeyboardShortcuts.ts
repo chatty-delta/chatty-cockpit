@@ -15,6 +15,7 @@ export function useKeyboardShortcuts() {
     'a': '/calendar', // 'a' for Agenda/Calendar
     'f': '/files',
     'w': '/knowledge', // 'w' for Wiki
+    'm': '/monitoring', // 'm' for Monitoring
     's': '/settings',
   }
 
