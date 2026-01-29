@@ -5,7 +5,8 @@ defineProps<{
   message: Message
 }>()
 
-function formatTime(date: Date) {
+function formatTime(timestamp: string | Date) {
+  const date = typeof timestamp === 'string' ? new Date(timestamp) : timestamp
   return new Intl.DateTimeFormat('de-AT', {
     hour: '2-digit',
     minute: '2-digit'

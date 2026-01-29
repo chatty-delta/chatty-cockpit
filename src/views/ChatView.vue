@@ -41,6 +41,16 @@ async function scrollToBottom() {
   }
 }
 
+function clearChat() {
+  if (confirm('Chat-Verlauf wirklich löschen?')) {
+    chat.clearMessages()
+    chat.addMessage({
+      role: 'assistant',
+      content: 'Hey! 👋 Chat wurde geleert. Wie kann ich dir helfen?'
+    })
+  }
+}
+
 onMounted(() => {
   if (chat.messages.length === 0) {
     chat.addMessage({
@@ -54,9 +64,19 @@ onMounted(() => {
 <template>
   <div class="h-full flex flex-col overflow-hidden">
     <!-- Header -->
-    <header class="flex items-center px-4 sm:px-6 py-3 sm:py-4 border-b border-slate-700 bg-slate-800/50 flex-shrink-0">
-      <span class="text-xl sm:text-2xl mr-2 sm:mr-3">💬</span>
-      <h1 class="font-semibold text-base sm:text-lg">Chat</h1>
+    <header class="flex items-center justify-between px-4 sm:px-6 py-3 sm:py-4 border-b border-slate-700 bg-slate-800/50 flex-shrink-0">
+      <div class="flex items-center">
+        <span class="text-xl sm:text-2xl mr-2 sm:mr-3">💬</span>
+        <h1 class="font-semibold text-base sm:text-lg">Chat</h1>
+      </div>
+      <button
+        v-if="chat.messages.length > 1"
+        @click="clearChat"
+        class="text-xs text-gray-400 hover:text-red-400 transition-colors"
+        title="Chat-Verlauf löschen"
+      >
+        🗑️ Verlauf löschen
+      </button>
     </header>
 
     <!-- Messages -->
