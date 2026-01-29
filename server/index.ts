@@ -956,6 +956,38 @@ app.post('/api/knowledge/internal', async (req, res) => {
   res.json({ article, created: true })
 })
 
+// Activity feed endpoint
+app.get('/api/activity', authMiddleware, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit as string) || 20
+    
+    if (!existsSync(ACTIVITY_LOG_FILE)) {
+      return res.json({ activities: [] })
+    }
+    
+    const content = await fsp.readFile(ACTIVITY_LOG_FILE, 'utf-8')
+    const lines = content.split('\n').filter(Boolean)
+    
+    // Parse and get last N entries
+    const activities = lines
+      .map(line => {
+        try {
+          return JSON.parse(line)
+        } catch {
+          return null
+        }
+      })
+      .filter(Boolean)
+      .slice(-limit)
+      .reverse() // Most recent first
+    
+    res.json({ activities })
+  } catch (e: any) {
+    console.error('Activity fetch error:', e)
+    res.status(500).json({ error: e?.message || 'Failed to fetch activities' })
+  }
+})
+
 app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }))
 
 const PORT = process.env.PORT || 3001

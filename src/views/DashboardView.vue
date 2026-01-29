@@ -147,7 +147,11 @@ onMounted(async () => {
       stats.value.articlesCount = articlesRes.data.articles?.length || 0
     } catch {}
 
-    // TODO: Fetch activity log when endpoint is available
+    // Fetch activity log
+    try {
+      const activityRes = await api.get('/api/activity?limit=10')
+      recentActivity.value = activityRes.data.activities || []
+    } catch {}
 
   } catch (e) {
     console.error('Dashboard load error:', e)
