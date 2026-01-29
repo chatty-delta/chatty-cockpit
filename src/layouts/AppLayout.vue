@@ -4,6 +4,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { ref, watch, onMounted, onUnmounted } from 'vue'
 import { useRemindersStore } from '@/stores/reminders'
 import CommandPalette from '@/components/CommandPalette.vue'
+import { useKeyboardShortcuts } from '@/composables/useKeyboardShortcuts'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -11,6 +12,7 @@ const route = useRoute()
 const collapsed = ref(false)
 const reminders = useRemindersStore()
 const showCommandPalette = ref(false)
+const { showHints, navShortcuts } = useKeyboardShortcuts()
 
 // Global Cmd+K shortcut
 function handleKeydown(e: KeyboardEvent) {
@@ -53,6 +55,29 @@ function logout() {
   <div class="h-screen flex flex-col md:flex-row bg-gray-900 text-white">
     <!-- Command Palette -->
     <CommandPalette :open="showCommandPalette" @close="showCommandPalette = false" />
+    
+    <!-- Keyboard Shortcut Hints -->
+    <Transition
+      enter-active-class="duration-150 ease-out"
+      enter-from-class="opacity-0 translate-y-2"
+      enter-to-class="opacity-100 translate-y-0"
+      leave-active-class="duration-100 ease-in"
+      leave-from-class="opacity-100 translate-y-0"
+      leave-to-class="opacity-0 translate-y-2"
+    >
+      <div 
+        v-if="showHints"
+        class="fixed bottom-20 md:bottom-4 left-1/2 transform -translate-x-1/2 z-50 bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 shadow-xl"
+      >
+        <div class="text-xs text-gray-400 mb-1">Gehe zu...</div>
+        <div class="flex gap-3 text-sm">
+          <span v-for="(path, key) in navShortcuts" :key="key" class="flex items-center gap-1">
+            <kbd class="px-1.5 py-0.5 bg-gray-700 rounded text-xs">{{ key }}</kbd>
+            <span class="text-gray-300">{{ path.slice(1) }}</span>
+          </span>
+        </div>
+      </div>
+    </Transition>
     <!-- Desktop Sidebar (hidden on mobile) -->
     <aside
       :class="collapsed ? 'w-16' : 'w-56'"
