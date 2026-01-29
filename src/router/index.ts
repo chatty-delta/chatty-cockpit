@@ -5,11 +5,6 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     {
-      path: '/',
-      name: 'home',
-      redirect: '/chat'
-    },
-    {
       path: '/login',
       name: 'login',
       component: () => import('@/views/LoginView.vue'),
@@ -22,10 +17,20 @@ const router = createRouter({
       meta: { guest: true }
     },
     {
-      path: '/chat',
-      name: 'chat',
-      component: () => import('@/views/ChatView.vue'),
-      meta: { requiresAuth: true }
+      path: '/',
+      component: () => import('@/layouts/AppLayout.vue'),
+      meta: { requiresAuth: true },
+      children: [
+        { path: '', redirect: '/dashboard' },
+        { path: 'dashboard', name: 'dashboard', component: () => import('@/views/DashboardView.vue') },
+        { path: 'chat', name: 'chat', component: () => import('@/views/ChatView.vue') },
+        { path: 'kanban', name: 'kanban', component: () => import('@/views/KanbanView.vue') },
+        { path: 'calendar', name: 'calendar', component: () => import('@/views/CalendarView.vue') },
+        { path: 'files', name: 'files', component: () => import('@/views/FilesView.vue') },
+        { path: 'reminders', name: 'reminders', component: () => import('@/views/RemindersView.vue') },
+        { path: 'knowledge', name: 'knowledge', component: () => import('@/views/KnowledgeView.vue') },
+        { path: 'settings', name: 'settings', component: () => import('@/views/SettingsView.vue') }
+      ]
     }
   ]
 })
