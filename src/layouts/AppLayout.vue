@@ -37,6 +37,7 @@ onUnmounted(() => {
 const navItems = [
   { path: '/dashboard', icon: '🏠', label: 'Dashboard' },
   { path: '/chat', icon: '💬', label: 'Chat' },
+  { path: '/email', icon: '📧', label: 'E-Mail' },
   { path: '/reminders', icon: '📌', label: 'Reminders', badge: () => reminders.openCount },
   { path: '/kanban', icon: '📋', label: 'Kanban' },
   { path: '/calendar', icon: '📅', label: 'Kalender' },

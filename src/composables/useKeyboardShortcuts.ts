@@ -10,6 +10,7 @@ export function useKeyboardShortcuts() {
   const navShortcuts: Record<string, string> = {
     'd': '/dashboard',
     'c': '/chat',
+    'e': '/email', // 'e' for Email
     'r': '/reminders',
     'k': '/kanban',
     'a': '/calendar', // 'a' for Agenda/Calendar

@@ -2,9 +2,11 @@ import express from 'express'
 import cors from 'cors'
 import jwt from 'jsonwebtoken'
 import nodemailer from 'nodemailer'
+import Imap from 'imap'
 import { v4 as uuidv4 } from 'uuid'
 import { config } from 'dotenv'
 import path from 'path'
+import os from 'os'
 import { readFileSync, writeFileSync, existsSync, promises as fsp } from 'fs'
 import { exec } from 'child_process'
 import { promisify } from 'util'
@@ -1347,28 +1349,28 @@ app.post('/api/monitoring/cron/health', async (req, res) => {
   // Same as check-all but uses internal secret
   const data = loadMonitoring()
   const alerts: string[] = []
-  
+
   for (const check of data.health) {
     const prevStatus = check.status
     const result = await checkHealth(check.url)
     Object.assign(check, result)
-    
+
     if (!check.history) check.history = []
     check.history.push({ ts: new Date().toISOString(), up: result.status === 'up' })
     if (check.history.length > 1000) check.history = check.history.slice(-1000)
-    
+
     if (prevStatus === 'up' && result.status === 'down') {
       alerts.push(`🔴 ${check.name || check.url} ist DOWN: ${result.error}`)
     } else if (prevStatus === 'down' && result.status === 'up') {
       alerts.push(`🟢 ${check.name || check.url} ist wieder UP`)
     }
   }
-  
+
   if (alerts.length > 0) {
-    const subject = alerts.some(a => a.includes('DOWN')) 
-      ? '🚨 Health Check Alert - Site DOWN' 
+    const subject = alerts.some(a => a.includes('DOWN'))
+      ? '🚨 Health Check Alert - Site DOWN'
       : '✅ Health Check - Site Recovered'
-    
+
     await sendAlertEmail(subject, `
       <div style="font-family: sans-serif; padding: 20px;">
         <h2 style="color: ${alerts.some(a => a.includes('DOWN')) ? '#e94560' : '#10b981'};">
@@ -1383,7 +1385,583 @@ app.post('/api/monitoring/cron/health', async (req, res) => {
       </div>
     `)
   }
-  
+
   saveMonitoring(data)
   res.json({ checked: data.health.length, alerts })
+})
+
+// ============================================================
+// Email Client (IMAP + SMTP)
+// ============================================================
+const EMAIL_CONFIG_FILE = path.join(os.homedir(), '.config', 'chatty', 'email.json')
+const EMAIL_SERVER = 'chatty.delta-mind.at'
+const IMAP_PORT = 993
+const SMTP_PORT = 587
+
+interface EmailConfig {
+  user: string
+  password: string
+}
+
+interface EmailMessage {
+  id: string
+  uid: number
+  folder: string
+  from: string
+  fromName?: string
+  to: string
+  subject: string
+  date: string
+  preview: string
+  body?: string
+  bodyHtml?: string
+  seen: boolean
+  flags: string[]
+}
+
+interface EmailFolder {
+  name: string
+  path: string
+  unreadCount?: number
+}
+
+function loadEmailConfig(): EmailConfig | null {
+  try {
+    if (existsSync(EMAIL_CONFIG_FILE)) {
+      return JSON.parse(readFileSync(EMAIL_CONFIG_FILE, 'utf-8'))
+    }
+  } catch (e) {
+    console.error('Failed to load email config:', e)
+  }
+  return null
+}
+
+function getImapConnection(): Promise<Imap> {
+  return new Promise((resolve, reject) => {
+    const config = loadEmailConfig()
+    if (!config) {
+      reject(new Error('Email config not found at ~/.config/chatty/email.json'))
+      return
+    }
+
+    const imap = new Imap({
+      user: config.user,
+      password: config.password,
+      host: EMAIL_SERVER,
+      port: IMAP_PORT,
+      tls: true,
+      tlsOptions: { rejectUnauthorized: false }
+    })
+
+    imap.once('ready', () => resolve(imap))
+    imap.once('error', (err: Error) => reject(err))
+    imap.connect()
+  })
+}
+
+function parseAddress(addr: any): { email: string; name?: string } {
+  if (!addr || !addr[0]) return { email: '' }
+  const a = addr[0]
+  return {
+    email: a.mailbox && a.host ? `${a.mailbox}@${a.host}` : '',
+    name: a.name || undefined
+  }
+}
+
+function decodeRFC2047(str: string): string {
+  if (!str) return ''
+  // Handle =?charset?encoding?text?= format
+  return str.replace(/=\?([^?]+)\?([BQbq])\?([^?]*)\?=/g, (_, charset, encoding, text) => {
+    try {
+      if (encoding.toUpperCase() === 'B') {
+        return Buffer.from(text, 'base64').toString('utf-8')
+      } else if (encoding.toUpperCase() === 'Q') {
+        return text.replace(/_/g, ' ').replace(/=([0-9A-F]{2})/gi, (_: string, hex: string) =>
+          String.fromCharCode(parseInt(hex, 16))
+        )
+      }
+    } catch {}
+    return text
+  })
+}
+
+// Get email folders
+app.get('/api/email/folders', authMiddleware, async (req, res) => {
+  let imap: Imap | null = null
+  try {
+    imap = await getImapConnection()
+
+    const folders: EmailFolder[] = await new Promise((resolve, reject) => {
+      imap!.getBoxes((err, boxes) => {
+        if (err) return reject(err)
+
+        const result: EmailFolder[] = []
+
+        function processBoxes(boxes: any, prefix = '') {
+          for (const [name, box] of Object.entries(boxes as Record<string, any>)) {
+            const fullPath = prefix ? `${prefix}${box.delimiter || '/'}${name}` : name
+            result.push({ name, path: fullPath })
+            if (box.children) {
+              processBoxes(box.children, fullPath)
+            }
+          }
+        }
+
+        processBoxes(boxes)
+        resolve(result)
+      })
+    })
+
+    // Get unread counts for common folders
+    const commonFolders = ['INBOX', 'Sent', 'Drafts', 'Trash', 'Junk', 'Spam']
+    for (const folder of folders) {
+      if (commonFolders.some(f => folder.path.toUpperCase().includes(f.toUpperCase()))) {
+        try {
+          const box = await new Promise<any>((resolve, reject) => {
+            imap!.openBox(folder.path, true, (err, box) => {
+              if (err) reject(err)
+              else resolve(box)
+            })
+          })
+          folder.unreadCount = box.messages?.unseen || 0
+        } catch {}
+      }
+    }
+
+    imap.end()
+    res.json({ folders })
+  } catch (e: any) {
+    if (imap) imap.end()
+    console.error('Email folders error:', e)
+    res.status(500).json({ error: e?.message || 'Failed to get folders' })
+  }
+})
+
+// Get messages from a folder
+app.get('/api/email/messages', authMiddleware, async (req, res) => {
+  let imap: Imap | null = null
+  try {
+    const folder = (req.query.folder as string) || 'INBOX'
+    const limit = parseInt(req.query.limit as string) || 50
+
+    imap = await getImapConnection()
+
+    const box = await new Promise<any>((resolve, reject) => {
+      imap!.openBox(folder, true, (err, box) => {
+        if (err) reject(err)
+        else resolve(box)
+      })
+    })
+
+    const total = box.messages.total
+    if (total === 0) {
+      imap.end()
+      return res.json({ messages: [], total: 0 })
+    }
+
+    const start = Math.max(1, total - limit + 1)
+    const range = `${start}:${total}`
+
+    const messages: EmailMessage[] = await new Promise((resolve, reject) => {
+      const msgs: EmailMessage[] = []
+      const fetch = imap!.seq.fetch(range, {
+        bodies: ['HEADER.FIELDS (FROM TO SUBJECT DATE)', 'TEXT'],
+        struct: true
+      })
+
+      fetch.on('message', (msg, seqno) => {
+        let uid = 0
+        let header = ''
+        let body = ''
+        let flags: string[] = []
+
+        msg.on('body', (stream, info) => {
+          let buffer = ''
+          stream.on('data', (chunk) => { buffer += chunk.toString('utf8') })
+          stream.on('end', () => {
+            if (info.which.includes('HEADER')) {
+              header = buffer
+            } else {
+              body = buffer.slice(0, 200) // Preview only
+            }
+          })
+        })
+
+        msg.once('attributes', (attrs) => {
+          uid = attrs.uid
+          flags = attrs.flags || []
+        })
+
+        msg.once('end', () => {
+          // Parse header
+          const fromMatch = header.match(/From:\s*(.+?)(?:\r?\n(?!\s)|\r?\n$)/i)
+          const toMatch = header.match(/To:\s*(.+?)(?:\r?\n(?!\s)|\r?\n$)/i)
+          const subjectMatch = header.match(/Subject:\s*(.+?)(?:\r?\n(?!\s)|\r?\n$)/i)
+          const dateMatch = header.match(/Date:\s*(.+?)(?:\r?\n(?!\s)|\r?\n$)/i)
+
+          const fromRaw = fromMatch?.[1]?.trim() || ''
+          const fromDecoded = decodeRFC2047(fromRaw)
+          // Extract email and name from "Name <email>" format
+          const emailMatch = fromDecoded.match(/<([^>]+)>/)
+          const fromEmail = emailMatch ? emailMatch[1] : fromDecoded.replace(/[<>]/g, '').trim()
+          const fromName = emailMatch ? fromDecoded.replace(/<[^>]+>/, '').trim().replace(/^"|"$/g, '') : undefined
+
+          msgs.push({
+            id: `${folder}-${uid}`,
+            uid,
+            folder,
+            from: fromEmail,
+            fromName: fromName || undefined,
+            to: decodeRFC2047(toMatch?.[1]?.trim() || ''),
+            subject: decodeRFC2047(subjectMatch?.[1]?.trim() || '(Kein Betreff)'),
+            date: dateMatch?.[1]?.trim() || new Date().toISOString(),
+            preview: body.replace(/\s+/g, ' ').trim().slice(0, 150),
+            seen: flags.includes('\\Seen'),
+            flags
+          })
+        })
+      })
+
+      fetch.once('error', reject)
+      fetch.once('end', () => {
+        // Sort by date descending (newest first)
+        msgs.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+        resolve(msgs)
+      })
+    })
+
+    imap.end()
+    res.json({ messages, total })
+  } catch (e: any) {
+    if (imap) imap.end()
+    console.error('Email messages error:', e)
+    res.status(500).json({ error: e?.message || 'Failed to get messages' })
+  }
+})
+
+// Get single message with full body
+app.get('/api/email/message/:id', authMiddleware, async (req, res) => {
+  let imap: Imap | null = null
+  try {
+    const { id } = req.params
+    const [folder, uidStr] = id.split(/-(?=\d+$)/)
+    const uid = parseInt(uidStr)
+
+    if (!folder || !uid) {
+      return res.status(400).json({ error: 'Invalid message ID' })
+    }
+
+    imap = await getImapConnection()
+
+    await new Promise<void>((resolve, reject) => {
+      imap!.openBox(folder, true, (err) => {
+        if (err) reject(err)
+        else resolve()
+      })
+    })
+
+    const message: EmailMessage = await new Promise((resolve, reject) => {
+      const fetch = imap!.fetch([uid], {
+        bodies: ['HEADER', 'TEXT', ''],
+        struct: true
+      })
+
+      let header = ''
+      let body = ''
+      let fullBody = ''
+      let flags: string[] = []
+      let msgUid = 0
+
+      fetch.on('message', (msg) => {
+        msg.on('body', (stream, info) => {
+          let buffer = ''
+          stream.on('data', (chunk) => { buffer += chunk.toString('utf8') })
+          stream.on('end', () => {
+            if (info.which === 'HEADER') {
+              header = buffer
+            } else if (info.which === 'TEXT') {
+              body = buffer
+            } else {
+              fullBody = buffer
+            }
+          })
+        })
+
+        msg.once('attributes', (attrs) => {
+          msgUid = attrs.uid
+          flags = attrs.flags || []
+        })
+      })
+
+      fetch.once('error', reject)
+      fetch.once('end', () => {
+        // Parse header
+        const fromMatch = header.match(/From:\s*(.+?)(?:\r?\n(?!\s)|\r?\n$)/i)
+        const toMatch = header.match(/To:\s*(.+?)(?:\r?\n(?!\s)|\r?\n$)/i)
+        const subjectMatch = header.match(/Subject:\s*(.+?)(?:\r?\n(?!\s)|\r?\n$)/i)
+        const dateMatch = header.match(/Date:\s*(.+?)(?:\r?\n(?!\s)|\r?\n$)/i)
+
+        const fromRaw = fromMatch?.[1]?.trim() || ''
+        const fromDecoded = decodeRFC2047(fromRaw)
+        const emailMatch = fromDecoded.match(/<([^>]+)>/)
+        const fromEmail = emailMatch ? emailMatch[1] : fromDecoded.replace(/[<>]/g, '').trim()
+        const fromName = emailMatch ? fromDecoded.replace(/<[^>]+>/, '').trim().replace(/^"|"$/g, '') : undefined
+
+        // Try to extract HTML or plain text body
+        let bodyText = body || fullBody
+        let bodyHtml: string | undefined
+
+        // Check for multipart content
+        const boundaryMatch = header.match(/boundary="?([^"\r\n]+)"?/i)
+        if (boundaryMatch) {
+          const boundary = boundaryMatch[1]
+          const parts = fullBody.split(new RegExp(`--${boundary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+
+          for (const part of parts) {
+            if (part.includes('Content-Type: text/html')) {
+              const htmlStart = part.indexOf('\r\n\r\n') || part.indexOf('\n\n')
+              if (htmlStart > -1) {
+                bodyHtml = part.slice(htmlStart + 4).trim()
+                // Handle quoted-printable
+                if (part.includes('quoted-printable')) {
+                  bodyHtml = bodyHtml.replace(/=\r?\n/g, '').replace(/=([0-9A-F]{2})/gi, (_, hex) =>
+                    String.fromCharCode(parseInt(hex, 16))
+                  )
+                }
+                // Handle base64
+                if (part.includes('base64')) {
+                  try {
+                    bodyHtml = Buffer.from(bodyHtml.replace(/\s/g, ''), 'base64').toString('utf-8')
+                  } catch {}
+                }
+              }
+            } else if (part.includes('Content-Type: text/plain') && !bodyText) {
+              const textStart = part.indexOf('\r\n\r\n') || part.indexOf('\n\n')
+              if (textStart > -1) {
+                bodyText = part.slice(textStart + 4).trim()
+              }
+            }
+          }
+        }
+
+        // Clean up body text
+        if (!bodyHtml && bodyText) {
+          // Handle quoted-printable
+          bodyText = bodyText.replace(/=\r?\n/g, '').replace(/=([0-9A-F]{2})/gi, (_, hex) =>
+            String.fromCharCode(parseInt(hex, 16))
+          )
+        }
+
+        resolve({
+          id,
+          uid: msgUid,
+          folder,
+          from: fromEmail,
+          fromName: fromName || undefined,
+          to: decodeRFC2047(toMatch?.[1]?.trim() || ''),
+          subject: decodeRFC2047(subjectMatch?.[1]?.trim() || '(Kein Betreff)'),
+          date: dateMatch?.[1]?.trim() || new Date().toISOString(),
+          preview: (bodyText || '').replace(/\s+/g, ' ').trim().slice(0, 150),
+          body: bodyText || undefined,
+          bodyHtml: bodyHtml || undefined,
+          seen: flags.includes('\\Seen'),
+          flags
+        })
+      })
+    })
+
+    imap.end()
+    res.json({ message })
+  } catch (e: any) {
+    if (imap) imap.end()
+    console.error('Email message error:', e)
+    res.status(500).json({ error: e?.message || 'Failed to get message' })
+  }
+})
+
+// Send email
+app.post('/api/email/send', authMiddleware, async (req, res) => {
+  try {
+    const { to, subject, body, replyTo } = req.body
+
+    if (!to || !subject) {
+      return res.status(400).json({ error: 'To and subject required' })
+    }
+
+    const config = loadEmailConfig()
+    if (!config) {
+      return res.status(500).json({ error: 'Email config not found' })
+    }
+
+    const smtpTransport = nodemailer.createTransport({
+      host: EMAIL_SERVER,
+      port: SMTP_PORT,
+      secure: false,
+      auth: {
+        user: config.user,
+        pass: config.password
+      },
+      tls: { rejectUnauthorized: false }
+    })
+
+    const mailOptions: any = {
+      from: config.user,
+      to,
+      subject,
+      text: body,
+      html: body?.includes('<') ? body : undefined
+    }
+
+    if (replyTo) {
+      mailOptions.inReplyTo = replyTo
+      mailOptions.references = replyTo
+    }
+
+    await smtpTransport.sendMail(mailOptions)
+
+    res.json({ success: true })
+  } catch (e: any) {
+    console.error('Email send error:', e)
+    res.status(500).json({ error: e?.message || 'Failed to send email' })
+  }
+})
+
+// Mark message as read
+app.post('/api/email/mark-read/:id', authMiddleware, async (req, res) => {
+  let imap: Imap | null = null
+  try {
+    const { id } = req.params
+    const [folder, uidStr] = id.split(/-(?=\d+$)/)
+    const uid = parseInt(uidStr)
+
+    if (!folder || !uid) {
+      return res.status(400).json({ error: 'Invalid message ID' })
+    }
+
+    imap = await getImapConnection()
+
+    await new Promise<void>((resolve, reject) => {
+      imap!.openBox(folder, false, (err) => {
+        if (err) reject(err)
+        else resolve()
+      })
+    })
+
+    await new Promise<void>((resolve, reject) => {
+      imap!.addFlags([uid], ['\\Seen'], (err) => {
+        if (err) reject(err)
+        else resolve()
+      })
+    })
+
+    imap.end()
+    res.json({ success: true })
+  } catch (e: any) {
+    if (imap) imap.end()
+    console.error('Email mark-read error:', e)
+    res.status(500).json({ error: e?.message || 'Failed to mark as read' })
+  }
+})
+
+// Mark message as unread
+app.post('/api/email/mark-unread/:id', authMiddleware, async (req, res) => {
+  let imap: Imap | null = null
+  try {
+    const { id } = req.params
+    const [folder, uidStr] = id.split(/-(?=\d+$)/)
+    const uid = parseInt(uidStr)
+
+    if (!folder || !uid) {
+      return res.status(400).json({ error: 'Invalid message ID' })
+    }
+
+    imap = await getImapConnection()
+
+    await new Promise<void>((resolve, reject) => {
+      imap!.openBox(folder, false, (err) => {
+        if (err) reject(err)
+        else resolve()
+      })
+    })
+
+    await new Promise<void>((resolve, reject) => {
+      imap!.delFlags([uid], ['\\Seen'], (err) => {
+        if (err) reject(err)
+        else resolve()
+      })
+    })
+
+    imap.end()
+    res.json({ success: true })
+  } catch (e: any) {
+    if (imap) imap.end()
+    console.error('Email mark-unread error:', e)
+    res.status(500).json({ error: e?.message || 'Failed to mark as unread' })
+  }
+})
+
+// Delete message (move to Trash or permanently delete)
+app.delete('/api/email/message/:id', authMiddleware, async (req, res) => {
+  let imap: Imap | null = null
+  try {
+    const { id } = req.params
+    const [folder, uidStr] = id.split(/-(?=\d+$)/)
+    const uid = parseInt(uidStr)
+
+    if (!folder || !uid) {
+      return res.status(400).json({ error: 'Invalid message ID' })
+    }
+
+    imap = await getImapConnection()
+
+    await new Promise<void>((resolve, reject) => {
+      imap!.openBox(folder, false, (err) => {
+        if (err) reject(err)
+        else resolve()
+      })
+    })
+
+    // Try to move to Trash, otherwise delete
+    const trashFolders = ['Trash', 'Deleted', 'Papierkorb']
+    let moved = false
+
+    if (!trashFolders.some(t => folder.toLowerCase().includes(t.toLowerCase()))) {
+      for (const trash of trashFolders) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            imap!.move([uid], trash, (err) => {
+              if (err) reject(err)
+              else resolve()
+            })
+          })
+          moved = true
+          break
+        } catch {}
+      }
+    }
+
+    if (!moved) {
+      // Permanently delete
+      await new Promise<void>((resolve, reject) => {
+        imap!.addFlags([uid], ['\\Deleted'], (err) => {
+          if (err) reject(err)
+          else resolve()
+        })
+      })
+
+      await new Promise<void>((resolve, reject) => {
+        imap!.expunge((err) => {
+          if (err) reject(err)
+          else resolve()
+        })
+      })
+    }
+
+    imap.end()
+    res.json({ success: true, moved })
+  } catch (e: any) {
+    if (imap) imap.end()
+    console.error('Email delete error:', e)
+    res.status(500).json({ error: e?.message || 'Failed to delete message' })
+  }
 })
