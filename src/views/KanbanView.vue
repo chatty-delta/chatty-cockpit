@@ -93,8 +93,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
+import { io, Socket } from 'socket.io-client'
 import { api } from '../api'
+import { useAuthStore } from '../stores/auth'
 
 interface Task {
   id: string
@@ -104,6 +106,9 @@ interface Task {
   priority?: 'low' | 'medium' | 'high'
   createdAt: string
 }
+
+const authStore = useAuthStore()
+let socket: Socket | null = null
 
 const columns = [
   { id: 'backlog', title: 'Backlog', icon: '📥' },
@@ -182,5 +187,48 @@ const onDrop = async (_event: DragEvent, columnId: string) => {
   draggedTask.value = null
 }
 
-onMounted(loadTasks)
+const connectSocket = () => {
+  const apiUrl = import.meta.env.VITE_API_URL || ''
+  socket = io(apiUrl, {
+    auth: { token: authStore.token }
+  })
+
+  socket.on('connect', () => {
+    console.log('🔌 Kanban WebSocket connected')
+  })
+
+  socket.on('kanban:task:created', ({ task }: { task: Task }) => {
+    // Only add if not already in list (avoid duplicate from own action)
+    if (!tasks.value.find(t => t.id === task.id)) {
+      tasks.value.push(task)
+    }
+  })
+
+  socket.on('kanban:task:updated', ({ task }: { task: Task }) => {
+    const idx = tasks.value.findIndex(t => t.id === task.id)
+    if (idx !== -1) {
+      tasks.value[idx] = task
+    }
+  })
+
+  socket.on('kanban:task:deleted', ({ id }: { id: string }) => {
+    tasks.value = tasks.value.filter(t => t.id !== id)
+  })
+
+  socket.on('disconnect', () => {
+    console.log('🔌 Kanban WebSocket disconnected')
+  })
+}
+
+onMounted(() => {
+  loadTasks()
+  connectSocket()
+})
+
+onUnmounted(() => {
+  if (socket) {
+    socket.disconnect()
+    socket = null
+  }
+})
 </script>

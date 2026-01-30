@@ -190,7 +190,7 @@ onMounted(async () => {
       </div>
 
       <!-- Stats Grid -->
-      <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
+      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <router-link 
           to="/reminders" 
           class="bg-gray-800/50 rounded-xl p-4 hover:bg-gray-800 transition-colors group"
@@ -234,6 +234,15 @@ onMounted(async () => {
           <div class="text-3xl mb-2">📚</div>
           <div class="text-2xl font-bold">{{ stats.articlesCount }}</div>
           <div class="text-sm text-gray-400 group-hover:text-gray-300">Wiki-Artikel</div>
+        </router-link>
+
+        <router-link 
+          to="/notes" 
+          class="bg-gray-800/50 rounded-xl p-4 hover:bg-gray-800 transition-colors group"
+        >
+          <div class="text-3xl mb-2">📝</div>
+          <div class="text-2xl font-bold">📝</div>
+          <div class="text-sm text-gray-400 group-hover:text-gray-300">Notizen</div>
         </router-link>
       </div>
 

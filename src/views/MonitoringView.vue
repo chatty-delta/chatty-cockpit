@@ -46,8 +46,8 @@ async function loadData() {
       api.get('/api/monitoring/certs'),
       api.get('/api/monitoring/health')
     ])
-    certChecks.value = certsRes.data.checks || []
-    healthChecks.value = healthRes.data.checks || []
+    certChecks.value = certsRes.certs || []
+    healthChecks.value = healthRes.health || []
   } catch (e) {
     console.error('Failed to load monitoring data:', e)
   } finally {
@@ -64,7 +64,7 @@ async function addCertCheck() {
     if (!url.startsWith('http')) url = 'https://' + url
     
     const res = await api.post('/api/monitoring/certs', { url })
-    certChecks.value.push(res.data.check)
+    certChecks.value.push(res.check)
     newCertUrl.value = ''
   } catch (e: any) {
     alert(e?.response?.data?.error || 'Fehler beim Hinzufügen')
@@ -96,7 +96,7 @@ async function addHealthCheck() {
       url,
       name: newHealthName.value.trim() || undefined
     })
-    healthChecks.value.push(res.data.check)
+    healthChecks.value.push(res.check)
     newHealthUrl.value = ''
     newHealthName.value = ''
   } catch (e: any) {
@@ -122,7 +122,7 @@ async function runCertChecks() {
   loading.value = true
   try {
     const res = await api.post('/api/monitoring/certs/check-all')
-    certChecks.value = res.data.checks || certChecks.value
+    certChecks.value = res.certs || certChecks.value
   } catch (e) {
     console.error('Check failed:', e)
   } finally {
@@ -134,7 +134,7 @@ async function runHealthChecks() {
   loading.value = true
   try {
     const res = await api.post('/api/monitoring/health/check-all')
-    healthChecks.value = res.data.checks || healthChecks.value
+    healthChecks.value = res.health || healthChecks.value
   } catch (e) {
     console.error('Check failed:', e)
   } finally {

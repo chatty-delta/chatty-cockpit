@@ -29,6 +29,7 @@ const router = createRouter({
         { path: 'files', name: 'files', component: () => import('@/views/FilesView.vue') },
         { path: 'reminders', name: 'reminders', component: () => import('@/views/RemindersView.vue') },
         { path: 'knowledge', name: 'knowledge', component: () => import('@/views/KnowledgeView.vue') },
+        { path: 'notes', name: 'notes', component: () => import('@/views/NotesView.vue') },
         { path: 'monitoring', name: 'monitoring', component: () => import('@/views/MonitoringView.vue') },
         { path: 'email', name: 'email', component: () => import('@/views/EmailView.vue') },
         { path: 'passwords', name: 'passwords', component: () => import('@/views/PasswordsView.vue') },

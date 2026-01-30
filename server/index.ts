@@ -11,16 +11,42 @@ import { readFileSync, writeFileSync, existsSync, promises as fsp } from 'fs'
 import { exec } from 'child_process'
 import { promisify } from 'util'
 import crypto from 'crypto'
+import { createServer } from 'http'
+import { Server as SocketIOServer } from 'socket.io'
 
 config()
 
 const app = express()
+const httpServer = createServer(app)
+const io = new SocketIOServer(httpServer, {
+  cors: { origin: '*', methods: ['GET', 'POST'] }
+})
+
+// Socket.io authentication middleware
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token
+  if (!token) return next(new Error('Authentication required'))
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as { email: string }
+    socket.data.user = decoded
+    next()
+  } catch {
+    next(new Error('Invalid token'))
+  }
+})
+
+io.on('connection', (socket) => {
+  console.log(`🔌 Socket connected: ${socket.data.user?.email}`)
+  socket.on('disconnect', () => {
+    console.log(`🔌 Socket disconnected: ${socket.data.user?.email}`)
+  })
+})
 app.use(cors())
 app.use(express.json())
 
 const JWT_SECRET = process.env.JWT_SECRET || 'chatty-cockpit-secret-change-me'
 const ALLOWED_EMAILS = (process.env.ALLOWED_EMAILS || 'phofmann@delta-mind.at').split(',')
-const APP_URL = process.env.APP_URL || 'https://app.chatty.delta-mind.at'
+const APP_URL = process.env.APP_URL || 'https://chatty.office.or.at'
 const GATEWAY_URL = process.env.GATEWAY_URL || 'http://127.0.0.1:18789'
 const GATEWAY_TOKEN = process.env.GATEWAY_TOKEN || ''
 const TASKS_FILE = '/home/ubuntu/clawd/kanban-tasks.json'
@@ -193,7 +219,7 @@ app.post('/api/auth/magic-link', async (req, res) => {
   const magicLink = `${APP_URL}/auth/verify?token=${token}`
   try {
     await transporter.sendMail({
-      from: '"Chatty Cockpit" <chatty@chatty.delta-mind.at>',
+      from: '"Chatty Cockpit" <chatty@office.or.at>',
       to: email,
       subject: '🔐 Dein Magic Link fürs Cockpit',
       html: `<div style="font-family: sans-serif;"><h2 style="color: #e94560;">Hey! 👋</h2><p><a href="${magicLink}" style="padding: 12px 24px; background: #e94560; color: white; text-decoration: none; border-radius: 8px;">Jetzt anmelden</a></p><p style="color: #666;">Gültig für 15 Min.</p></div>`
@@ -354,7 +380,10 @@ app.post('/api/kanban/tasks', authMiddleware, async (req, res) => {
     summary: `Task created: ${task.title}`,
     meta: { id: task.id, column: task.column, priority: task.priority }
   })
-  
+
+  // Emit WebSocket event for real-time updates
+  io.emit('kanban:task:created', { task })
+
   res.json({ task })
 })
 
@@ -390,7 +419,10 @@ app.patch('/api/kanban/tasks/:id', authMiddleware, async (req, res) => {
       meta: { id: task.id, updates }
     })
   }
-  
+
+  // Emit WebSocket event for real-time updates
+  io.emit('kanban:task:updated', { task })
+
   res.json({ task })
 })
 
@@ -410,7 +442,10 @@ app.delete('/api/kanban/tasks/:id', authMiddleware, async (req, res) => {
     summary: `Task deleted: ${task?.title || id}`,
     meta: { id, column: task?.column }
   })
-  
+
+  // Emit WebSocket event for real-time updates
+  io.emit('kanban:task:deleted', { id })
+
   res.json({ success: true })
 })
 
@@ -1397,12 +1432,13 @@ app.post('/api/passwords/generate', authMiddleware, (req, res) => {
 app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }))
 
 const PORT = process.env.PORT || 3001
-app.listen(PORT, () => console.log(`🚀 Chatty Cockpit API on port ${PORT}`))
+httpServer.listen(PORT, () => console.log(`🚀 Chatty Cockpit API on port ${PORT} (WebSocket enabled)`))
 
 // ============================================================
 // Monitoring (Certificates & Health Checks)
 // ============================================================
 const MONITORING_FILE = '/home/ubuntu/clawd/monitoring.json'
+const NOTES_FILE = '/home/ubuntu/clawd/notes.json'
 const ALERT_EMAIL = process.env.ALERT_EMAIL || 'phofmann@delta-mind.at'
 
 interface CertCheck {
@@ -1544,7 +1580,7 @@ async function checkHealth(url: string): Promise<Partial<HealthCheckItem>> {
 async function sendAlertEmail(subject: string, body: string) {
   try {
     await transporter.sendMail({
-      from: '"Chatty Monitor" <chatty@chatty.delta-mind.at>',
+      from: '"Chatty Monitor" <chatty@office.or.at>',
       to: ALERT_EMAIL,
       subject,
       html: body
@@ -1557,7 +1593,7 @@ async function sendAlertEmail(subject: string, body: string) {
 // Certificate endpoints
 app.get('/api/monitoring/certs', authMiddleware, (req, res) => {
   const data = loadMonitoring()
-  res.json({ checks: data.certs })
+  res.json({ certs: data.certs })
 })
 
 app.post('/api/monitoring/certs', authMiddleware, async (req, res) => {
@@ -1603,7 +1639,7 @@ app.post('/api/monitoring/certs/check-all', authMiddleware, async (req, res) => 
   }
   
   saveMonitoring(data)
-  res.json({ checks: data.certs })
+  res.json({ certs: data.certs })
 })
 
 // Health check endpoints
@@ -1619,7 +1655,7 @@ app.get('/api/monitoring/health', authMiddleware, (req, res) => {
     return h
   })
   
-  res.json({ checks })
+  res.json({ check: checks })
 })
 
 app.post('/api/monitoring/health', authMiddleware, async (req, res) => {
@@ -1695,14 +1731,14 @@ app.post('/api/monitoring/health/check-all', authMiddleware, async (req, res) =>
           ${alerts.map(a => `<li>${a}</li>`).join('')}
         </ul>
         <p style="color: #666; margin-top: 20px;">
-          <a href="https://app.chatty.delta-mind.at/monitoring">Zum Cockpit →</a>
+          <a href="https://chatty.office.or.at/monitoring">Zum Cockpit →</a>
         </p>
       </div>
     `)
   }
   
   saveMonitoring(data)
-  res.json({ checks: data.health, alerts })
+  res.json({ health: data.health, alerts })
 })
 
 // Internal endpoint for cron jobs
@@ -1735,7 +1771,7 @@ app.post('/api/monitoring/cron/certs', async (req, res) => {
           ${warnings.map(w => `<li>${w}</li>`).join('')}
         </ul>
         <p style="color: #666; margin-top: 20px;">
-          <a href="https://app.chatty.delta-mind.at/monitoring">Zum Cockpit →</a>
+          <a href="https://chatty.office.or.at/monitoring">Zum Cockpit →</a>
         </p>
       </div>
     `)
@@ -1784,7 +1820,7 @@ app.post('/api/monitoring/cron/health', async (req, res) => {
           ${alerts.map(a => `<li>${a}</li>`).join('')}
         </ul>
         <p style="color: #666; margin-top: 20px;">
-          <a href="https://app.chatty.delta-mind.at/monitoring">Zum Cockpit →</a>
+          <a href="https://chatty.office.or.at/monitoring">Zum Cockpit →</a>
         </p>
       </div>
     `)
@@ -1798,7 +1834,7 @@ app.post('/api/monitoring/cron/health', async (req, res) => {
 // Email Client (IMAP + SMTP)
 // ============================================================
 const EMAIL_CONFIG_FILE = path.join(os.homedir(), '.config', 'chatty', 'email.json')
-const EMAIL_SERVER = 'chatty.delta-mind.at'
+const EMAIL_SERVER = 'office.or.at'
 const IMAP_PORT = 993
 const SMTP_PORT = 587
 
@@ -2368,4 +2404,98 @@ app.delete('/api/email/message/:id', authMiddleware, async (req, res) => {
     console.error('Email delete error:', e)
     res.status(500).json({ error: e?.message || 'Failed to delete message' })
   }
+})
+
+// ============================================================
+// Notes
+// ============================================================
+interface Note {
+  id: string
+  title: string
+  content: string
+  createdAt: string
+  updatedAt: string
+  createdBy: string
+}
+
+function loadNotes(): Note[] {
+  try {
+    if (existsSync(NOTES_FILE)) {
+      return JSON.parse(readFileSync(NOTES_FILE, 'utf-8'))
+    }
+  } catch (e) {
+    console.error('Failed to load notes:', e)
+  }
+  return []
+}
+
+function saveNotes(notes: Note[]) {
+  writeFileSync(NOTES_FILE, JSON.stringify(notes, null, 2))
+}
+
+// Get all notes
+app.get('/api/notes', authMiddleware, (req, res) => {
+  const notes = loadNotes()
+  // Sort by updatedAt descending
+  notes.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+  res.json({ notes })
+})
+
+// Get single note
+app.get('/api/notes/:id', authMiddleware, (req, res) => {
+  const notes = loadNotes()
+  const note = notes.find(n => n.id === req.params.id)
+  if (!note) return res.status(404).json({ error: 'Note not found' })
+  res.json({ note })
+})
+
+// Create note
+app.post('/api/notes', authMiddleware, (req, res) => {
+  const { title, content } = req.body
+  const user = (req as any).user as { email: string }
+
+  const now = new Date().toISOString()
+  const note: Note = {
+    id: uuidv4(),
+    title: title?.trim() || 'Unbenannt',
+    content: content || '',
+    createdAt: now,
+    updatedAt: now,
+    createdBy: user.email
+  }
+
+  const notes = loadNotes()
+  notes.push(note)
+  saveNotes(notes)
+
+  res.json({ note })
+})
+
+// Update note
+app.put('/api/notes/:id', authMiddleware, (req, res) => {
+  const { title, content } = req.body
+  const notes = loadNotes()
+  const note = notes.find(n => n.id === req.params.id)
+
+  if (!note) return res.status(404).json({ error: 'Note not found' })
+
+  if (title !== undefined) note.title = title.trim() || 'Unbenannt'
+  if (content !== undefined) note.content = content
+  note.updatedAt = new Date().toISOString()
+
+  saveNotes(notes)
+  res.json({ note })
+})
+
+// Delete note
+app.delete('/api/notes/:id', authMiddleware, (req, res) => {
+  const notes = loadNotes()
+  const next = notes.filter(n => n.id !== req.params.id)
+
+  if (next.length === notes.length) {
+    return res.status(404).json({ error: 'Note not found' })
+  }
+
+  saveNotes(next)
+  res.json({ success: true })
 })
