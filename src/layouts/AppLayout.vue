@@ -46,6 +46,7 @@ const navItems = [
   { path: '/notes', icon: '📝', label: 'Notizen' },
   { path: '/monitoring', icon: '🔍', label: 'Monitoring' },
   { path: '/passwords', icon: '🔐', label: 'Passwörter' },
+  { path: '/projects', icon: '📂', label: 'Projekte' },
   { path: '/settings', icon: '⚙️', label: 'Settings' },
 ]
 

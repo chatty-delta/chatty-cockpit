@@ -33,6 +33,7 @@ const router = createRouter({
         { path: 'monitoring', name: 'monitoring', component: () => import('@/views/MonitoringView.vue') },
         { path: 'email', name: 'email', component: () => import('@/views/EmailView.vue') },
         { path: 'passwords', name: 'passwords', component: () => import('@/views/PasswordsView.vue') },
+        { path: 'projects', name: 'projects', component: () => import('@/views/ProjectsView.vue') },
         { path: 'settings', name: 'settings', component: () => import('@/views/SettingsView.vue') }
       ]
     }

@@ -2499,3 +2499,146 @@ app.delete('/api/notes/:id', authMiddleware, (req, res) => {
   saveNotes(next)
   res.json({ success: true })
 })
+
+// ============================================================
+// Projects (~/projects/ directory listing)
+// ============================================================
+const PROJECTS_ROOT = path.join(os.homedir(), 'projects')
+
+interface ProjectGitInfo {
+  branch: string
+  hasChanges: boolean
+  changedFiles: number
+  lastCommit?: {
+    hash: string
+    message: string
+    date: string
+    author: string
+  }
+}
+
+interface ProjectPackageJson {
+  name: string
+  version: string
+  description?: string
+}
+
+interface ProjectInfo {
+  name: string
+  path: string
+  git?: ProjectGitInfo
+  packageJson?: ProjectPackageJson
+}
+
+async function getProjectInfo(projectPath: string, name: string): Promise<ProjectInfo> {
+  const info: ProjectInfo = { name, path: projectPath }
+
+  // Check for git
+  const gitDir = path.join(projectPath, '.git')
+  if (existsSync(gitDir)) {
+    try {
+      // Get current branch
+      const { stdout: branch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath, timeout: 5000 })
+
+      // Get status (number of changed files)
+      const { stdout: status } = await execAsync('git status --porcelain', { cwd: projectPath, timeout: 5000 })
+      const changedFiles = status.trim().split('\n').filter(Boolean).length
+
+      // Get last commit
+      let lastCommit: ProjectGitInfo['lastCommit'] | undefined
+      try {
+        const { stdout: log } = await execAsync('git log -1 --format="%H|||%s|||%aI|||%an"', { cwd: projectPath, timeout: 5000 })
+        const [hash, message, date, author] = log.trim().split('|||')
+        if (hash && message) {
+          lastCommit = { hash, message, date, author }
+        }
+      } catch {}
+
+      info.git = {
+        branch: branch.trim(),
+        hasChanges: changedFiles > 0,
+        changedFiles,
+        lastCommit
+      }
+    } catch (e) {
+      // Git commands failed, skip git info
+    }
+  }
+
+  // Check for package.json
+  const pkgPath = path.join(projectPath, 'package.json')
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'))
+      info.packageJson = {
+        name: pkg.name || name,
+        version: pkg.version || '0.0.0',
+        description: pkg.description
+      }
+    } catch {}
+  }
+
+  return info
+}
+
+// List all projects
+app.get('/api/projects', authMiddleware, async (req, res) => {
+  try {
+    if (!existsSync(PROJECTS_ROOT)) {
+      return res.json({ projects: [] })
+    }
+
+    const dirents = await fsp.readdir(PROJECTS_ROOT, { withFileTypes: true })
+    const projectDirs = dirents.filter(d => d.isDirectory() && !d.name.startsWith('.'))
+
+    const projects: ProjectInfo[] = await Promise.all(
+      projectDirs.map(async d => {
+        const projectPath = path.join(PROJECTS_ROOT, d.name)
+        return getProjectInfo(projectPath, d.name)
+      })
+    )
+
+    // Sort by last commit date (most recent first), then by name
+    projects.sort((a, b) => {
+      const dateA = a.git?.lastCommit?.date ? new Date(a.git.lastCommit.date).getTime() : 0
+      const dateB = b.git?.lastCommit?.date ? new Date(b.git.lastCommit.date).getTime() : 0
+      if (dateA !== dateB) return dateB - dateA
+      return a.name.localeCompare(b.name)
+    })
+
+    res.json({ projects })
+  } catch (e: any) {
+    console.error('Failed to list projects:', e)
+    res.status(500).json({ error: e?.message || 'Failed to list projects' })
+  }
+})
+
+// Git pull for a project
+app.post('/api/projects/:name/pull', authMiddleware, async (req, res) => {
+  const { name } = req.params
+
+  // Sanitize project name to prevent path traversal
+  if (name.includes('/') || name.includes('\\') || name.includes('..')) {
+    return res.status(400).json({ error: 'Invalid project name' })
+  }
+
+  const projectPath = path.join(PROJECTS_ROOT, name)
+
+  if (!existsSync(projectPath)) {
+    return res.status(404).json({ error: 'Project not found' })
+  }
+
+  const gitDir = path.join(projectPath, '.git')
+  if (!existsSync(gitDir)) {
+    return res.status(400).json({ error: 'Not a git repository' })
+  }
+
+  try {
+    const { stdout, stderr } = await execAsync('git pull', { cwd: projectPath, timeout: 60000 })
+    const output = (stdout + '\n' + stderr).trim()
+    res.json({ success: true, output })
+  } catch (e: any) {
+    const output = e.stderr || e.stdout || e.message || 'Git pull failed'
+    res.json({ success: false, output })
+  }
+})
