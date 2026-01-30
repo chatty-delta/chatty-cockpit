@@ -10,6 +10,7 @@ import os from 'os'
 import { readFileSync, writeFileSync, existsSync, promises as fsp } from 'fs'
 import { exec } from 'child_process'
 import { promisify } from 'util'
+import crypto from 'crypto'
 
 config()
 
@@ -988,6 +989,409 @@ app.get('/api/activity', authMiddleware, async (req, res) => {
     console.error('Activity fetch error:', e)
     res.status(500).json({ error: e?.message || 'Failed to fetch activities' })
   }
+})
+
+// ============================================================
+// Password Manager
+// ============================================================
+const PASSWORDS_FILE = path.join(os.homedir(), '.config', 'chatty', 'passwords.json')
+const PASSWORDS_SESSION_EXPIRY = 5 * 60 * 1000 // 5 minutes
+
+interface PasswordEntry {
+  id: string
+  name: string
+  username: string
+  password: string // Encrypted
+  url?: string
+  notes?: string
+  createdAt: string
+  updatedAt: string
+}
+
+interface PasswordVault {
+  salt: string
+  iv: string
+  authTag: string
+  encryptedData: string
+  masterPasswordHash: string // For verification
+}
+
+// Session storage for unlocked vaults (in-memory, keyed by user email)
+const passwordSessions = new Map<string, { key: Buffer; expiresAt: number }>()
+
+async function ensurePasswordsDir() {
+  const dir = path.dirname(PASSWORDS_FILE)
+  await fsp.mkdir(dir, { recursive: true })
+}
+
+function deriveKey(password: string, salt: Buffer): Buffer {
+  return crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha256')
+}
+
+function encryptData(data: string, key: Buffer): { iv: string; authTag: string; encrypted: string } {
+  const iv = crypto.randomBytes(16)
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  let encrypted = cipher.update(data, 'utf8', 'hex')
+  encrypted += cipher.final('hex')
+  const authTag = cipher.getAuthTag()
+  return {
+    iv: iv.toString('hex'),
+    authTag: authTag.toString('hex'),
+    encrypted
+  }
+}
+
+function decryptData(encrypted: string, key: Buffer, iv: string, authTag: string): string {
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'hex'))
+  decipher.setAuthTag(Buffer.from(authTag, 'hex'))
+  let decrypted = decipher.update(encrypted, 'hex', 'utf8')
+  decrypted += decipher.final('utf8')
+  return decrypted
+}
+
+function hashMasterPassword(password: string, salt: Buffer): string {
+  return crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex')
+}
+
+async function loadPasswordVault(): Promise<PasswordVault | null> {
+  try {
+    if (existsSync(PASSWORDS_FILE)) {
+      return JSON.parse(await fsp.readFile(PASSWORDS_FILE, 'utf-8'))
+    }
+  } catch (e) {
+    console.error('Failed to load password vault:', e)
+  }
+  return null
+}
+
+async function savePasswordVault(vault: PasswordVault) {
+  await ensurePasswordsDir()
+  await fsp.writeFile(PASSWORDS_FILE, JSON.stringify(vault, null, 2))
+}
+
+function getPasswordSession(email: string): Buffer | null {
+  const session = passwordSessions.get(email)
+  if (!session) return null
+  if (Date.now() > session.expiresAt) {
+    passwordSessions.delete(email)
+    return null
+  }
+  return session.key
+}
+
+function setPasswordSession(email: string, key: Buffer) {
+  passwordSessions.set(email, {
+    key,
+    expiresAt: Date.now() + PASSWORDS_SESSION_EXPIRY
+  })
+}
+
+function clearPasswordSession(email: string) {
+  passwordSessions.delete(email)
+}
+
+// Check if vault is set up
+app.get('/api/passwords/status', authMiddleware, async (req, res) => {
+  const user = (req as any).user as { email: string }
+  const vault = await loadPasswordVault()
+  const session = getPasswordSession(user.email)
+
+  res.json({
+    isSetup: !!vault,
+    isUnlocked: !!session
+  })
+})
+
+// Setup master password (first time)
+app.post('/api/passwords/setup', authMiddleware, async (req, res) => {
+  const { masterPassword } = req.body
+
+  if (!masterPassword || masterPassword.length < 8) {
+    return res.status(400).json({ error: 'Master password must be at least 8 characters' })
+  }
+
+  const existingVault = await loadPasswordVault()
+  if (existingVault) {
+    return res.status(400).json({ error: 'Vault already exists' })
+  }
+
+  const salt = crypto.randomBytes(32)
+  const key = deriveKey(masterPassword, salt)
+  const masterPasswordHash = hashMasterPassword(masterPassword, salt)
+
+  // Encrypt empty array as initial data
+  const { iv, authTag, encrypted } = encryptData(JSON.stringify([]), key)
+
+  const vault: PasswordVault = {
+    salt: salt.toString('hex'),
+    iv,
+    authTag,
+    encryptedData: encrypted,
+    masterPasswordHash
+  }
+
+  await savePasswordVault(vault)
+
+  // Auto-unlock after setup
+  const user = (req as any).user as { email: string }
+  setPasswordSession(user.email, key)
+
+  res.json({ success: true })
+})
+
+// Unlock vault
+app.post('/api/passwords/unlock', authMiddleware, async (req, res) => {
+  const user = (req as any).user as { email: string }
+  const { masterPassword } = req.body
+
+  if (!masterPassword) {
+    return res.status(400).json({ error: 'Master password required' })
+  }
+
+  const vault = await loadPasswordVault()
+  if (!vault) {
+    return res.status(400).json({ error: 'Vault not set up' })
+  }
+
+  const salt = Buffer.from(vault.salt, 'hex')
+  const providedHash = hashMasterPassword(masterPassword, salt)
+
+  if (providedHash !== vault.masterPasswordHash) {
+    return res.status(401).json({ error: 'Invalid master password' })
+  }
+
+  const key = deriveKey(masterPassword, salt)
+  setPasswordSession(user.email, key)
+
+  res.json({ success: true })
+})
+
+// Lock vault
+app.post('/api/passwords/lock', authMiddleware, (req, res) => {
+  const user = (req as any).user as { email: string }
+  clearPasswordSession(user.email)
+  res.json({ success: true })
+})
+
+// List all passwords (without actual password values)
+app.get('/api/passwords', authMiddleware, async (req, res) => {
+  const user = (req as any).user as { email: string }
+  const key = getPasswordSession(user.email)
+
+  if (!key) {
+    return res.status(401).json({ error: 'Vault locked' })
+  }
+
+  const vault = await loadPasswordVault()
+  if (!vault) {
+    return res.status(400).json({ error: 'Vault not set up' })
+  }
+
+  try {
+    const decrypted = decryptData(vault.encryptedData, key, vault.iv, vault.authTag)
+    const entries: PasswordEntry[] = JSON.parse(decrypted)
+
+    // Return without password field
+    const safeEntries = entries.map(({ password, ...rest }) => rest)
+    res.json({ entries: safeEntries })
+  } catch (e) {
+    clearPasswordSession(user.email)
+    res.status(401).json({ error: 'Decryption failed' })
+  }
+})
+
+// Get single password (with decrypted password)
+app.get('/api/passwords/:id', authMiddleware, async (req, res) => {
+  const user = (req as any).user as { email: string }
+  const key = getPasswordSession(user.email)
+
+  if (!key) {
+    return res.status(401).json({ error: 'Vault locked' })
+  }
+
+  const vault = await loadPasswordVault()
+  if (!vault) {
+    return res.status(400).json({ error: 'Vault not set up' })
+  }
+
+  try {
+    const decrypted = decryptData(vault.encryptedData, key, vault.iv, vault.authTag)
+    const entries: PasswordEntry[] = JSON.parse(decrypted)
+    const entry = entries.find(e => e.id === req.params.id)
+
+    if (!entry) {
+      return res.status(404).json({ error: 'Entry not found' })
+    }
+
+    res.json({ entry })
+  } catch (e) {
+    clearPasswordSession(user.email)
+    res.status(401).json({ error: 'Decryption failed' })
+  }
+})
+
+// Create new password entry
+app.post('/api/passwords', authMiddleware, async (req, res) => {
+  const user = (req as any).user as { email: string }
+  const key = getPasswordSession(user.email)
+
+  if (!key) {
+    return res.status(401).json({ error: 'Vault locked' })
+  }
+
+  const { name, username, password, url, notes } = req.body
+
+  if (!name || !password) {
+    return res.status(400).json({ error: 'Name and password required' })
+  }
+
+  const vault = await loadPasswordVault()
+  if (!vault) {
+    return res.status(400).json({ error: 'Vault not set up' })
+  }
+
+  try {
+    const decrypted = decryptData(vault.encryptedData, key, vault.iv, vault.authTag)
+    const entries: PasswordEntry[] = JSON.parse(decrypted)
+
+    const now = new Date().toISOString()
+    const newEntry: PasswordEntry = {
+      id: uuidv4(),
+      name,
+      username: username || '',
+      password,
+      url: url || undefined,
+      notes: notes || undefined,
+      createdAt: now,
+      updatedAt: now
+    }
+
+    entries.push(newEntry)
+
+    // Re-encrypt
+    const { iv, authTag, encrypted } = encryptData(JSON.stringify(entries), key)
+    vault.iv = iv
+    vault.authTag = authTag
+    vault.encryptedData = encrypted
+
+    await savePasswordVault(vault)
+
+    // Return without password
+    const { password: _, ...safeEntry } = newEntry
+    res.json({ entry: safeEntry })
+  } catch (e) {
+    clearPasswordSession(user.email)
+    res.status(401).json({ error: 'Encryption failed' })
+  }
+})
+
+// Update password entry
+app.put('/api/passwords/:id', authMiddleware, async (req, res) => {
+  const user = (req as any).user as { email: string }
+  const key = getPasswordSession(user.email)
+
+  if (!key) {
+    return res.status(401).json({ error: 'Vault locked' })
+  }
+
+  const { name, username, password, url, notes } = req.body
+
+  const vault = await loadPasswordVault()
+  if (!vault) {
+    return res.status(400).json({ error: 'Vault not set up' })
+  }
+
+  try {
+    const decrypted = decryptData(vault.encryptedData, key, vault.iv, vault.authTag)
+    const entries: PasswordEntry[] = JSON.parse(decrypted)
+    const entryIndex = entries.findIndex(e => e.id === req.params.id)
+
+    if (entryIndex === -1) {
+      return res.status(404).json({ error: 'Entry not found' })
+    }
+
+    const entry = entries[entryIndex]
+    if (name !== undefined) entry.name = name
+    if (username !== undefined) entry.username = username
+    if (password !== undefined) entry.password = password
+    if (url !== undefined) entry.url = url || undefined
+    if (notes !== undefined) entry.notes = notes || undefined
+    entry.updatedAt = new Date().toISOString()
+
+    // Re-encrypt
+    const { iv, authTag, encrypted } = encryptData(JSON.stringify(entries), key)
+    vault.iv = iv
+    vault.authTag = authTag
+    vault.encryptedData = encrypted
+
+    await savePasswordVault(vault)
+
+    // Return without password
+    const { password: _, ...safeEntry } = entry
+    res.json({ entry: safeEntry })
+  } catch (e) {
+    clearPasswordSession(user.email)
+    res.status(401).json({ error: 'Encryption failed' })
+  }
+})
+
+// Delete password entry
+app.delete('/api/passwords/:id', authMiddleware, async (req, res) => {
+  const user = (req as any).user as { email: string }
+  const key = getPasswordSession(user.email)
+
+  if (!key) {
+    return res.status(401).json({ error: 'Vault locked' })
+  }
+
+  const vault = await loadPasswordVault()
+  if (!vault) {
+    return res.status(400).json({ error: 'Vault not set up' })
+  }
+
+  try {
+    const decrypted = decryptData(vault.encryptedData, key, vault.iv, vault.authTag)
+    let entries: PasswordEntry[] = JSON.parse(decrypted)
+    const initialLength = entries.length
+    entries = entries.filter(e => e.id !== req.params.id)
+
+    if (entries.length === initialLength) {
+      return res.status(404).json({ error: 'Entry not found' })
+    }
+
+    // Re-encrypt
+    const { iv, authTag, encrypted } = encryptData(JSON.stringify(entries), key)
+    vault.iv = iv
+    vault.authTag = authTag
+    vault.encryptedData = encrypted
+
+    await savePasswordVault(vault)
+
+    res.json({ success: true })
+  } catch (e) {
+    clearPasswordSession(user.email)
+    res.status(401).json({ error: 'Encryption failed' })
+  }
+})
+
+// Generate random password
+app.post('/api/passwords/generate', authMiddleware, (req, res) => {
+  const { length = 16, includeSymbols = true, includeNumbers = true, includeUppercase = true } = req.body
+
+  const passwordLength = Math.min(Math.max(parseInt(length) || 16, 8), 128)
+
+  let charset = 'abcdefghijklmnopqrstuvwxyz'
+  if (includeUppercase) charset += 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  if (includeNumbers) charset += '0123456789'
+  if (includeSymbols) charset += '!@#$%^&*()_+-=[]{}|;:,.<>?'
+
+  const randomBytes = crypto.randomBytes(passwordLength)
+  let password = ''
+  for (let i = 0; i < passwordLength; i++) {
+    password += charset[randomBytes[i] % charset.length]
+  }
+
+  res.json({ password })
 })
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }))

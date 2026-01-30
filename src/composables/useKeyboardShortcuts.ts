@@ -17,6 +17,7 @@ export function useKeyboardShortcuts() {
     'f': '/files',
     'w': '/knowledge', // 'w' for Wiki
     'm': '/monitoring', // 'm' for Monitoring
+    'p': '/passwords', // 'p' for Passwords
     's': '/settings',
   }
 

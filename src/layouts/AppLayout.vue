@@ -44,6 +44,7 @@ const navItems = [
   { path: '/files', icon: '📁', label: 'Files' },
   { path: '/knowledge', icon: '📚', label: 'Wiki' },
   { path: '/monitoring', icon: '🔍', label: 'Monitoring' },
+  { path: '/passwords', icon: '🔐', label: 'Passwörter' },
   { path: '/settings', icon: '⚙️', label: 'Settings' },
 ]
 
